@@ -1,0 +1,693 @@
+
+# coding: utf-8
+
+# In[155]:
+
+import os
+import sys
+import warnings
+import time 
+import copy
+import random
+from itertools import product
+from BBGfunctions import BDH, BDH_slopes
+from stratpy.db import pdblp
+from ts_tools import ts_shift_net, ts_shift_per,merge_split
+import pandas as pd
+import numpy as np
+from pandas.tseries.holiday import USFederalHolidayCalendar
+from pandas.tseries.offsets import CustomBusinessDay
+from datetime import datetime, date
+from dateutil import relativedelta
+
+import sklearn
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import confusion_matrix, mean_squared_error, explained_variance_score, r2_score, accuracy_score
+from sklearn.linear_model import LinearRegression, Lasso, lasso_path, lars_path, LassoLarsIC
+from sklearn.ensemble.forest import RandomForestRegressor
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.utils.testing import all_estimators
+
+from scipy.stats import chisquare, kendalltau
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+
+
+get_ipython().magic('matplotlib inline')
+
+
+# In[2]:
+
+ENDdt= date.today()
+STARTdt = datetime.date(datetime.today() + relativedelta.relativedelta(years=-10))
+
+bbg_ENDdt = str(ENDdt.year) + ENDdt.strftime('%m') + ENDdt.strftime('%d')
+bbg_STARTdt = str(STARTdt.year) + STARTdt.strftime('%m') + STARTdt.strftime('%d')
+
+
+# In[3]:
+
+tkrs =['UX2 INDEX']
+
+fields = ['PX_LAST']
+
+tgt = BDH(tkrs,fields,bbg_STARTdt,bbg_ENDdt) 
+
+
+# In[4]:
+
+tkrs =['USGG10YR Index',
+       'USSN0C10 ICPL Curncy',
+       'CVIX Index'
+      ]
+
+fields = ['PX_LAST']
+
+net_feat = BDH(tkrs,fields,bbg_STARTdt,bbg_ENDdt)
+net_feat = net_feat.dropna()
+
+
+# In[5]:
+
+tkrs =['SPX Index'
+      
+      ]
+
+fields = ['PX_LAST']
+
+per_feat = BDH(tkrs,fields,bbg_STARTdt,bbg_ENDdt)
+per_feat = per_feat.dropna()
+
+
+# In[6]:
+
+tkrs = [['ED2 COMDTY','ED6 COMDTY'],
+       ['UX1 INDEX','UX3 INDEX']    
+      ]
+
+slopes = BDH_slopes(tkrs,'PX_LAST',bbg_STARTdt,bbg_ENDdt)
+
+
+# In[7]:
+
+shifts=[3,20]
+
+
+# In[8]:
+
+net_feat = ts_shift_net(net_feat,shifts)
+per_feat = ts_shift_per(per_feat,shifts)
+slopes = ts_shift_net(slopes,shifts)
+tgt = ts_shift_net(tgt,[-5])
+
+
+# In[40]:
+
+X_pre = pd.DataFrame()
+X_pre = X_pre.join(net_feat,how='right')
+X_pre = X_pre.join(per_feat)
+X_pre = X_pre.join(slopes)
+Y_pre = tgt[tgt.columns[1]]
+
+
+# In[37]:
+
+print(net_feat.shape)
+print(per_feat.shape)
+print(slopes.shape)
+print(X_pre.shape)
+
+
+# In[62]:
+
+x,y = merge_split(X_pre,Y_pre)
+
+
+# In[143]:
+
+X = x.values
+Y = y.values.reshape(-1,1)
+nrows = X.shape[0]
+print(X.shape)
+print(Y.shape)
+
+
+# In[144]:
+
+xnames = list(x.columns)
+ynames = [y.name]
+
+
+# In[145]:
+
+def subset_selection(X, Y, model_aic, target, features, verbose=False):
+    nrows, npreds = X.shape
+    nows, nresps = Y.shape
+    coef_dict = []
+    
+    for response_index in range(nresps):
+        y = Y[:,response_index]
+        model_aic.fit(X, y)
+        predcols = [i for i in range(npreds) if model_aic.coef_[i] !=0]
+
+        #y_response = model_aic.predict(X)
+        # print ("In-sample LASSO R-squared: %.6f" % r2_score(y, y_response))
+        if verbose and target:
+            print("LASSO variables selected for %s: " % target[response_index])
+            print([features[i] for i in predcols])
+        
+        if not predcols:
+            if verbose and target:
+                print("No coefs selected for " + target[response_index] + ", using all")
+                print("---")
+            predcols = list(range(npreds))    
+            
+        # fit OLS vs. selected vars, better fit w/o LASSO penalties
+        # in-sample R-squared using LASSO coeffs
+        coef_dict.append(predcols)
+        if verbose and target and features:
+            print("Running OLS for " + target[response_index] + " against " + str([features[i] for i in predcols]))
+            # col nums of selected target
+            model_ols = LinearRegression()
+            model_ols.fit(X[:, predcols], y)
+            y_pred = model_ols.predict(X[:, predcols])
+            print ("In-sample OLS R-squared: %.2f%%" % (100 * r2_score(y, y_pred)))
+            print("---")
+            
+    return coef_dict
+
+
+# In[146]:
+
+
+#coef_dict = subset_selection(X, Y, LassoLarsIC(criterion='aic'))
+coef_dict = subset_selection(X, Y, LassoLarsIC(criterion='aic'), ynames, xnames ,verbose=False)
+print(coef_dict)
+
+
+# In[175]:
+
+def predict_with_subsets(X, Y, create_model, coef_dict, target, features, verbose=False):
+    """evaluate subset selection, pass a model function and subsets, compute avg R-squared"""
+    #global target
+
+    nrows, ncols = Y.shape
+    model = create_model()
+    
+    scores = []
+    for response_col in range(ncols):
+        y = Y[:,response_col]
+
+#        print("LASSO variables selected for %s: " % pred)
+#        print(coef_dict[pred])
+        
+        if not coef_dict[response_col]:
+            if verbose:
+                print("No coefs selected for " + target[response_col])
+ #           print("---")
+            continue
+        # fit model vs. selected vars, better fit w/o LASSO penalties
+        # in-sample R-squared using LASSO coeffs
+        #print("Running model for " + pred + " against " + str(coef_dict[pred]))
+        # col nums of selected predictors
+        predcols = coef_dict[response_col]
+        model.fit(X[:, predcols], y)
+        y_pred = model.predict(X[:, predcols])
+        score = r2_score(y, y_pred)
+        scores.append(score)
+        if verbose:
+            print ("In-sample R-squared: %.2f%% for %s against %s" % (score*100, target[response_col], 
+                                                                      str([features[i] for i in coef_dict[response_col]])))
+#        print("---")
+    
+    if verbose:
+        print("Mean R-squared: %.2f%%" % (100 * np.mean(np.array(scores))))
+    return np.mean(np.array(scores))
+    
+
+
+# In[176]:
+
+predict_with_subsets(X, Y, LinearRegression, coef_dict, ynames, xnames ,verbose=False)
+
+
+# In[177]:
+
+FIRST_TRAIN_DAY = 200
+FIRST_PREDICT_DAY = FIRST_TRAIN_DAY 
+
+print(X[FIRST_TRAIN_DAY])
+print(x.iloc[FIRST_TRAIN_DAY])
+
+
+# In[178]:
+
+class PredictWrapper():
+    """Wrap an sklearn model e.g. LinearRegression to fit, predict all vars as a vector, 
+    match the way our Keras model will do it"""
+
+    def __init__(self, create_model, coef_dict, fit_missing=None):
+        self.create_model = create_model        
+        self.coef_dict = coef_dict
+        self.fit_missing = fit_missing
+        self.models = []
+        
+    def fit(self, X_fit, Y_fit, verbose=False):
+        
+        self.nrows, self.ycols = Y_fit.shape
+        self.models = []
+        # fit model for each column
+        for responsecol in range(self.ycols):
+            if self.coef_dict[responsecol]:
+                # column indexes to fit against each other
+                predcols = self.coef_dict[responsecol]
+            else: # no columns selected
+                if not self.fit_missing:
+                    # default: don't fit if no predictors selected
+                    self.models.append(None)
+                    #print(self.models[-1])
+                    continue
+                elif self.fit_missing == "mean":
+                    # append a numeric value to use
+                    self.models.append(np.mean(Y_fit[:,responsecol]))
+                    #print(self.models[-1])
+                    continue
+                elif self.fit_missing == "all":
+                    # predcols = all columns
+                    predcols = range(X_fit.shape[1])
+
+            model = self.create_model() # create 1 sklearn model for each column
+            model.fit(X_fit[:, predcols], Y_fit[:,responsecol])
+            if verbose:
+                print("fit on " + str(X_fit[:, predcols].shape) + str(predcols))
+                print(model.coef_)
+                            
+            self.models.append(model)
+                
+            #debug
+            #print(responsecol)
+            #print(X_fit[:, predcols])
+            #print("=====")
+            #print(Y_fit[:,responsecol])
+            #print("=====")
+            #print(self.model.coef_)
+            #print(self.model.intercept_)
+            #print("=====")                
+
+    def predict(self, X_predict, verbose=False):
+
+        predictions = []
+        nrows = X_predict.shape[0]
+
+        for responsecol in range(self.ycols):
+            #print (type(self.models[responsecol]))
+            if type(self.models[responsecol]) == np.float64:
+                pred = np.array([self.models[responsecol]] * nrows).reshape(nrows,1)
+                predictions.append(pred)
+                sys.stdout.write('\010#')
+            elif not self.models[responsecol]: 
+                # don't predict
+                predictions.append(np.array([np.nan] * nrows ).reshape(nrows,1))
+                sys.stdout.write('\010N')
+            else:
+                predcols = self.coef_dict[responsecol]
+                y_pred = self.models[responsecol].predict(X_predict[:,predcols])
+                if verbose:
+                    print("predict on" + str(X_predict[:, predcols].shape) + str(predcols))
+                    print(y_pred)
+                predictions.append(y_pred.reshape(nrows,1))
+        
+        return np.hstack(predictions)
+
+
+# In[188]:
+
+# typical pipeline
+# backtestmodel = BacktestModel(X, # predictors
+#                              Y, # target
+#                              create_model=LinearRegression, # create_model which returns a model (needed for 'timestep' which creates different model each timestep)
+#                              # or model = someKerasModel, # initialized model that supports fit(X,Y), predict(X) , predicts an entire row,
+#                              coef_dict_param=coef_dict_paper, # how to map predictors to target ("all", "timestep", or a list of lists)
+#                              startindex=FIRST_TRAIN_MONTHS, # initial training for backtest
+#                              fit_missing='mean', # what to do when no predictors are selected in coef_dict_param - use all predictors, use historical mean, use np.nan
+#                              scaler = None) # scaling function like MinMaxScaler
+
+# backtestmodel.gen_predictions(verbose=False) # starting from startindex, step through X,Y month by month, fit up to current month, predict next month, store prediction in self.P
+# backtestmodel.walkforward_xval(n_splits=5, verbose=True) # calls gen_predictions with a large step, fits and predicts one large fold at a time (useful to cross-validate quickly)
+# backtestmodel.evaluate_predictions() # report metrics on prediction : MSE etc. #TODO: support custom calcs before/after/instead of default calcs
+# backtestmodel.gen_returns(calc_returns, verbose=True) # takes a function that returns portfolio returns based on self.P, stores in self.R
+# backtestmodel.report_returns(start_date=start_date_str, freq='M') # calc cumulative perf and report (TODO: allow it to take a reporting function to run before/after/in place of default report)
+# backtestmodel.evaluate_quantiles(chart=True, verbose=True) # report quantile metrics # TODO: make this a custom calc passed into evaluate_predictions
+
+class BacktestModel():
+    
+    def __init__(self, 
+                 X, # predictors
+                 Y, # target
+                 model=None, # model that supports fit(X,Y), predict(X) , predicts an entire row,
+                 create_model=None, # or create_model which returns a model (needed for 'timestep' but slows down so pass model if dynamic not needed)
+                 coef_dict_param="all", # mapping of predictors to target ("all", "timestep", or a list of lists)
+                 startindex=FIRST_TRAIN_DAY,
+                 scaler=None,
+                 fit_missing=None):
+        
+        self.Xrows, self.Xcols = X.shape
+        self.Yrows, self.Ycols = Y.shape
+        
+        if self.Xrows != self.Yrows:
+            raise(ValueError, "Shapes differ: X %s, Y %s" % (str(X.shape), str(Y.shape)))            
+            
+        self.X = X
+        self.Y = Y
+        self.Xscale = X.copy()
+        self.Yscale = Y.copy()
+
+        if scaler:
+            print("scaler: %s " %str(scaler))
+            # by rows
+            # MinMaxScaler: each row (min->0, max->1) 
+            # StandardScaler: each row (mean->0, SD->1)            
+            # self.Xscale = scaler().fit_transform(self.Xscale.transpose()).transpose()
+            # self.Yscale = scaler().fit_transform(self.Yscale.transpose()).transpose()
+            # by cols
+            # MinMaxScaler: each col (min->0, max->1) 
+            # StandardScaler: each col (mean->0, SD->1)            
+            self.Xscale = scaler().fit_transform(self.Xscale)
+            self.Yscale = scaler().fit_transform(self.Yscale)
+        
+        self.model = model
+        self.create_model = create_model
+        self.coef_dict_param = coef_dict_param
+        self.startindex = startindex
+        self.fit_missing = fit_missing
+
+    def fit_predict(self, ntrain, npredict=1, verbose=False):
+        """for backtest, train model using Y v. X 
+        train on first ntrain rows. if ntrain=121, fit 0:120
+        predict following npredict rows 
+        if npredict=1, predict row 121
+        if npredict=12, predict rows 121-132
+        """
+        
+        # fit first ntrain rows
+        X_fit = self.Xscale[:ntrain]  # e.g. 0:120
+        Y_fit = self.Yscale[:ntrain]
+        # predict npredict rows
+        X_predict = self.Xscale[ntrain:ntrain+npredict] # 121-122
+        X_predict = X_predict.reshape(npredict,self.Xcols)
+       
+        # if no coef_dict select predictors into coef_dict
+        if self.coef_dict_param == "timestep":
+            msg = "Performing subset selection"
+            coef_dict = subset_selection(X_fit, Y_fit, LassoLarsIC(criterion='aic'))
+        # if coef_dict == "all" use all predictors for each response        
+        elif self.coef_dict_param == 'all':
+            msg = "Using all predictors"
+            coef_dict = [range(self.Xcols) for _ in range(self.ycols)]
+        else: # should check valid dict
+            msg = "Using coef_dict predictors"
+            coef_dict = self.coef_dict_param
+        if verbose: 
+            print(msg)
+
+        if self.create_model:
+            self.model = PredictWrapper(self.create_model, coef_dict, fit_missing=self.fit_missing)
+            
+        self.model.fit(X_fit, Y_fit, verbose=verbose)
+        return self.model.predict(X_predict, verbose=verbose)
+
+    # predict all months
+    # initial train_months = 120 -> train first model on 120 rows
+    # first prediction will be in P[120] (121st row)
+    # step = 6 -> predict following 6 rows, then step forward 6 months at a time
+    # initialize predictions matrix self.P
+    
+    # use either step or folds
+    # step, do range(self.startindex, nrows, step)
+    # folds, at each fold train 0:startfold, predict startfold+1:endfold
+    # store only out-of-sample predictions in P, calc out-of-sample MSE
+    
+    # using a step > 1 or folds is quicker, for quicker xval, or to speed up by not estimating model at each timestep
+
+    def gen_predictions(self,
+                        step=1, 
+                        splits=None,
+                        verbose=False):
+
+        self.P = np.zeros_like(self.Y)
+
+        progress_i = 0
+        self.nrows, self.ycols = Y.shape
+        
+        if splits:
+            month_indexes = splits[:-1] # last index is nrows
+        else:
+            # create list of steps
+            month_indexes = list(range(self.startindex, nrows, step))
+        steps = [month_indexes[i+1]-month_indexes[i] for i in range(len(month_indexes)-1)]
+        # last step -> end
+        steps.append(self.nrows - month_indexes[-1])
+        
+        if verbose:
+            print ("Steps: " + str(month_indexes))
+
+        for month_index, forecast_rows in zip(month_indexes, steps):
+            if verbose:
+                print("Training on first %d rows (%d:%d), putting predictions in rows %s" % (month_index, 
+                                                                                            0, month_index-1, 
+                                                                                            str(range(month_index,month_index+forecast_rows))))
+            predictions = self.fit_predict(month_index, forecast_rows, verbose=False)
+            
+            first_pred_row = month_index
+            for row_index in range(forecast_rows):
+                self.P[first_pred_row+row_index] = predictions[row_index]
+            sys.stdout.write('.')
+            progress_i += 1
+            if progress_i % 80 == 0:
+                print("")
+                print("%s Still training step %d of %d" % (time.strftime("%H:%M:%S"), progress_i, len(month_indexes)))
+            sys.stdout.flush()
+        print("")
+        
+
+    def evaluate_predictions(self):
+        
+        # evaluate prediction (can move to separate function)
+        msetemp = (self.P[self.startindex:]-self.Yscale[self.startindex:])**2
+        #remove nans
+        msetemp = msetemp[~np.isnan(msetemp)]
+        self.mse = np.mean(msetemp)
+        print("OOS MSE across all predictions: %.4f" % self.mse)
+        self.model.fit(self.Xscale, self.Yscale)
+        Y_pred = self.model.predict(self.Xscale)
+        self.in_sample_mse = np.mean((Y_pred - self.Yscale) ** 2)
+        print("In-sample MSE: %.4f" % self.in_sample_mse)
+
+        # force unpredicted ys to be nans, then remove nans
+        vartemp = self.Yscale[self.startindex:] - self.P[self.startindex:] + self.P[self.startindex:]
+        vartemp = vartemp[~np.isnan(vartemp)]
+        y_variance = np.var(vartemp[self.startindex:])
+        print("Variance: %.4f" % (y_variance))
+        print("R-squared: %.4f" % (1- self.mse/y_variance))
+        
+        return(self.mse)
+
+    def evaluate_quantiles(self, chart=False, verbose=False):
+    
+        self.P_quantiles = np.zeros_like(self.P)
+        self.Y_quantiles = np.zeros_like(self.Y)
+        self.kendalltaus = []
+        self.ktpvals = []
+        # compute score for predicted quantiles vs. actual (expected) quantiles
+        N_QUANTILES=5
+        for row in range(self.startindex, self.P_quantiles.shape[0]):
+            #print(self.P[row])
+            self.P_quantiles[row] = pd.qcut(self.P[row], N_QUANTILES, range(N_QUANTILES))
+            self.Y_quantiles[row] = pd.qcut(self.Y[row], N_QUANTILES, range(N_QUANTILES))
+            kt, p_val = kendalltau(self.P[row], self.Y[row])
+            self.kendalltaus.append(kt)
+            self.ktpvals.append(p_val)
+
+        self.kendalltau = np.mean(self.kendalltaus)
+        self.kendalltau_pvalue = np.mean(self.ktpvals)         
+        print("Avg rank correlation (Kendall's tau): %.4f (Expected: 0)" % (self.kendalltau))
+        pred_quantiles = self.P_quantiles[self.startindex:]
+        true_quantiles = self.Y_quantiles[self.startindex:]
+
+        nrows, ncols = pred_quantiles.shape
+
+        pred_quantiles = pred_quantiles.reshape(nrows*ncols)
+        true_quantiles = true_quantiles.reshape(nrows*ncols)
+        self.quintile_accuracy = accuracy_score(pred_quantiles, true_quantiles)
+        print("5-quintile accuracy: %.4f (Expected: 0.2)" % (self.quintile_accuracy))
+        
+        pred_direction = np.zeros(nrows*ncols)
+        true_direction = np.zeros(nrows*ncols)
+        for i in range(nrows*ncols):
+            if pred_quantiles[i] == 4:
+                pred_direction[i] = 1
+            elif pred_quantiles[i] == 0:
+                pred_direction[i] = -1
+            if true_quantiles[i] == 4:
+                true_direction[i] = 1
+            elif true_quantiles[i] == 0:
+                true_direction[i] = -1
+        self.directional_accuracy = accuracy_score(pred_direction, true_direction)
+        print("Long/short/flat accuracy: %.4f (Expected: 0.44)" % (self.directional_accuracy))
+        
+        nrows = nrows * ncols
+            
+        conf_mat_expected = np.array([[0.64, 0.16],[0.16, 0.04]])*nrows
+
+        myscores = []
+        for q in range(5):
+            temp_pred = pred_quantiles == q
+            temp_actual = true_quantiles == q
+            conf_mat5 = confusion_matrix(temp_pred, temp_actual)
+            diff_mat = conf_mat5 - conf_mat_expected
+            if verbose:
+                print("Confusion matrix for quantile %d" % q)
+                print(conf_mat5)
+                cstmp, cspvtmp = chisquare(conf_mat5.reshape(4), conf_mat_expected.reshape(4))
+                print("Chi-square: %.4f (p-value: %.8f)" % (cstmp, cspvtmp))
+
+            # probably no valid statistical interpretation but 
+            # average of improvement in true positive % and true negative %
+            myscore = diff_mat[1][1]
+            myscores.append(myscore)
+
+        # sum of true positive for top and bottom quintiles
+        self.excess_tp = myscores[0] + myscores[4]
+        print("Excess true positive in quintiles 1 + 5: %f" % (self.excess_tp))
+
+        conf_mat = confusion_matrix(pred_quantiles, true_quantiles)
+        if chart:
+            fig, ax = plt.subplots(figsize=(10,10))
+            sns.heatmap(conf_mat, annot=True, fmt='d')
+            plt.ylabel('Actual Quintile')
+            plt.xlabel('Predicted Quintile')
+            plt.show()
+        
+        return None
+
+    def walkforward_xval (self, n_splits=5, verbose=False):
+        """quick and dirty genreturns, with a step"""
+        # generate k-folds
+        kf = KFold(n_splits=n_splits)
+        kf.get_n_splits(X)
+        last_indexes = []
+        for train_index, test_index in kf.split(X):
+            # use test_index as last index to train
+            last_index = test_index[-1] + 1
+            last_indexes.append(last_index)
+        print("%s Generate splits %s" % (time.strftime("%H:%M:%S"), str([i for i in last_indexes])))
+        #override startindex
+        self.startindex = last_indexes[0]
+        return self.gen_predictions(splits=last_indexes, verbose=verbose)
+    
+    def gen_returns(self, port_returns_func, verbose=False):
+
+        self.R = np.zeros(self.P.shape[0])
+        first_pred_month=self.startindex
+        
+        indcount = [0] * self.ycols
+        longcount = [0] * self.ycols
+        shortcount = [0] * self.ycols
+        
+        for month_index in range(first_pred_month, nrows-1):
+            return_month = month_index + 1
+            port_return, long_indexes, short_indexes = port_returns_func(self.P[month_index], 
+                                                                         self.X[return_month])
+            self.R[return_month] = port_return
+            
+            for i in long_indexes:
+                indcount[i] += 1
+                longcount[i] += 1
+            for i in short_indexes:
+                indcount[i] += 1
+                shortcount[i] += 1
+        #if verbose:
+        #    for i in range(len(target)):
+        #        print("%s: long %d times, short %d times, total %d times" % (predictors[i], 
+        #                                                                     longcount[i], 
+        #                                                                     shortcount[i], 
+        #                                                                     indcount[i]))
+        return self.R
+
+    def report_returns(self, start_date='01/01/1970', freq='M'):
+
+        first_pred_month=self.startindex        
+        self.results = self.R[first_pred_month:]
+        nmonths = self.results.shape[0]
+        nyears = nmonths/12.0
+        index = pd.date_range(start_date,periods=nmonths, freq=freq)
+        perfdata = pd.DataFrame(self.results,index=index,columns=['Returns'])
+        perfdata['Equity'] = 100 * np.cumprod(1 + self.results / 100)
+        self.cumulative_return = perfdata['Equity']
+        self.mean_monthly_return_annualized = np.mean(1 + self.results/100) ** 12 - 1
+        self.mean_return = (self.cumulative_return[-1]/100) ** (1.0/nyears) - 1
+        self.annualized_vol = np.std(self.results/100) * np.sqrt(12.0)
+        self.sharpe = self.mean_monthly_return_annualized/self.annualized_vol
+        print("Mean return: %.3f%%" % (self.mean_return * 100 ))
+        #print("Mean monthly annualized return: %.3f%%" % (self.mean_monthly_return_annualized * 100 ))
+        #print("Monthly annualized volatility: %.3f%%" % (self.annualized_vol * 100))
+        print("Monthly Sharpe ratio: %.3f" % (self.sharpe))
+
+
+# In[189]:
+
+NUMSTOCKS = 6 # top quintile (and bottom)
+
+def calc_returns(prediction_row, return_row, numstocks=NUMSTOCKS, verbose=False):
+
+    # ensure nan sorts to top for shorts
+    short_sort_array = [999999 if np.isnan(x) else x for x in prediction_row]
+    # pick bottom numstocks
+    select_array = np.argsort(short_sort_array)
+    short_indexes = select_array[:numstocks]
+
+    # ensure nan sorts to bottom for longs
+    long_sort_array = [-999999 if np.isnan(x) else x for x in prediction_row]
+    # pick top numstocks
+    select_array = np.argsort(long_sort_array)
+    long_indexes = select_array[-numstocks:]
+    
+    if verbose:
+        print("Longs: %s" %(str([(i,prediction_row[i]) for i in long_indexes])))
+        print("Shorts: %s" %(str([(i,prediction_row[i]) for i in short_indexes])))
+
+    # compute equal weighted long/short return
+    return np.mean(return_row[long_indexes])/2 - np.mean(return_row[short_indexes])/2, long_indexes, short_indexes
+
+
+# In[190]:
+
+# test fit_predict
+backtestmodel = BacktestModel(X, Y, create_model=LinearRegression, coef_dict_param=coef_dict, startindex=FIRST_TRAIN_DAY)
+print(backtestmodel.fit_predict(201, npredict=1, verbose=False))
+
+
+# In[191]:
+
+backtestmodel1 = BacktestModel(X, Y, 
+                              create_model=LinearRegression, 
+                              coef_dict_param=coef_dict, 
+                              startindex=FIRST_TRAIN_DAY,
+                              fit_missing='mean',
+                              scaler = None)
+
+
+# In[192]:
+
+backtestmodel.gen_predictions(verbose=False)
+backtestmodel.gen_returns(calc_returns, verbose=True)
+
+
+# In[ ]:
+
+
+
